@@ -604,7 +604,7 @@ def preflight_connectivity(url: str, verify: bool, timeout: int, console: "Conso
 
 def fetch_url(url: str, verify: bool, timeout: int) -> "requests.Response | None":
     try:
-        return requests.get(url, timeout=timeout, verify=verify, headers=DEFAULT_HEADERS)
+        return requests.get(url, timeout=(3, timeout), verify=verify, headers=DEFAULT_HEADERS)
     except requests.exceptions.Timeout:
         return None
     except requests.exceptions.SSLError:
@@ -732,6 +732,7 @@ def seed_discovery(
         "/oauth2/default/v1/keys",
         "/oauth2/v1/keys",
     ]
+    urls_to_fetch = []
     for base in base_urls:
         for path in seed_paths:
             url = base.rstrip("/") + path
@@ -739,31 +740,37 @@ def seed_discovery(
                 if url in visited:
                     continue
                 visited.add(url)
-            try:
-                response = fetch_url(url, verify=verify, timeout=timeout)
-            except requests.exceptions.SSLError:
-                continue
-            except requests.exceptions.ConnectionError:
-                continue
-            if response is None:
-                continue
-            process_response(
-                url,
-                url,
-                response.status_code,
-                response.content,
-                response.headers.get("content-type", ""),
-                output,
-                verify,
-                timeout,
-                visited,
-                results,
-                lock,
-                console,
-                verbose,
-                allow_external,
-                max_candidates,
-            )
+            urls_to_fetch.append(url)
+
+    def seed_worker(seed_url: str) -> None:
+        try:
+            response = fetch_url(seed_url, verify=verify, timeout=timeout)
+        except requests.exceptions.SSLError:
+            return
+        except requests.exceptions.ConnectionError:
+            return
+        if response is None:
+            return
+        process_response(
+            seed_url,
+            seed_url,
+            response.status_code,
+            response.content,
+            response.headers.get("content-type", ""),
+            output,
+            verify,
+            timeout,
+            visited,
+            results,
+            lock,
+            console,
+            verbose,
+            allow_external,
+            max_candidates,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        list(executor.map(seed_worker, urls_to_fetch))
 
 
 def jwk_set_to_pems(jwk_set: dict) -> list[bytes]:
