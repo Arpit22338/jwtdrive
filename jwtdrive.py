@@ -926,6 +926,8 @@ def process_response(
                     lock,
                     console,
                     verbose,
+                    allow_external,
+                    max_candidates,
                 )
             return
 
