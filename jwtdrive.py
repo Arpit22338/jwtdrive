@@ -769,8 +769,10 @@ def seed_discovery(
             max_candidates,
         )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        list(executor.map(seed_worker, urls_to_fetch))
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+    for url in urls_to_fetch:
+        executor.submit(seed_worker, url)
+    executor.shutdown(wait=False)
 
 
 def jwk_set_to_pems(jwk_set: dict) -> list[bytes]:
@@ -1334,6 +1336,7 @@ def main() -> int:
         console.print("[red]Error: Unable to read wordlist file.[/red]")
         return 1
 
+    results: list[Result] = []
     try:
         results = brute_force(
             target,
@@ -1348,12 +1351,20 @@ def main() -> int:
             args.follow_hosts,
             args.max_candidates,
         )
+    except KeyboardInterrupt:
+        pass
     except requests.exceptions.ConnectionError:
         return 1
 
     render_summary(results, console)
+    if not results:
+        console.print("[yellow]No keys found on target.[/yellow]")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        console = Console()
+        console.print("\n[yellow]Interrupted. Exiting.[/yellow]")
