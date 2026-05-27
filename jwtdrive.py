@@ -760,7 +760,6 @@ def seed_discovery(
                 verbose,
                 allow_external,
                 max_candidates,
-                False,
             )
 
 
