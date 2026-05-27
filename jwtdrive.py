@@ -446,6 +446,9 @@ DEFAULT_HEADERS = {
     "Accept": "application/json,*/*;q=0.8",
 }
 MAX_CANDIDATES = 40
+MAX_DISCOVER_REQUESTS = 50
+_discover_count: int = 0
+_discover_lock: threading.Lock = threading.Lock()
 
 
 @dataclass
@@ -825,6 +828,7 @@ def process_response(
     allow_external: bool,
     max_candidates: int,
 ) -> None:
+    global _discover_count
     if status != 200:
         if verbose:
             with lock:
@@ -1015,7 +1019,15 @@ def process_response(
         with lock:
             results.append(Result(display_path, status, key_type, "-"))
 
+    should_follow = False
+    with _discover_lock:
+        if _discover_count < MAX_DISCOVER_REQUESTS:
+            should_follow = True
+    if not should_follow:
+        return
     for candidate in extract_candidate_urls(content, url, allow_external, max_candidates):
+        with _discover_lock:
+            _discover_count += 1
         with lock:
             if candidate in visited:
                 continue
