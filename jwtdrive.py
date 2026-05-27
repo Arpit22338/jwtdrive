@@ -63,6 +63,15 @@ Internal functions:
   Purpose: Pull JavaScript asset URLs for scraping JWKS/key references.
 - find_possible_secrets(text: bytes) -> list[str]
   Purpose: Identify likely shared secret values for HS256 tokens.
+- root_domain(host: str) -> str
+  Purpose: Extract a root domain for subdomain expansion.
+- build_idp_bases(target: str, allow_external: bool) -> list[str]
+  Purpose: Build candidate IdP base URLs for discovery.
+- seed_discovery(base_urls: list[str], output: str, verify: bool, timeout: int,
+  visited: set[str], results: list[Result], lock: threading.Lock,
+  console: rich.console.Console, verbose: bool, allow_external: bool,
+  max_candidates: int, secret_hunt: bool) -> None
+  Purpose: Fetch likely IdP endpoints before brute-force.
 - jwk_set_to_pems(jwk_set: dict) -> list[bytes]
   Purpose: Convert all keys in a JWK Set to PEM-encoded public keys.
 - extract_pem_from_cert(content: bytes) -> bytes | None
@@ -507,11 +516,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=MAX_CANDIDATES,
         help="Maximum candidate URLs to follow per response",
     )
-    parser.add_argument(
-        "--secret-hunt",
-        action="store_true",
-        help="Scan responses for likely JWT shared secrets (heuristic)",
-    )
     return parser
 
 
@@ -667,23 +671,97 @@ def extract_script_urls(
     return script_urls
 
 
-def find_possible_secrets(text: bytes) -> list[str]:
-    decoded = text.decode("utf-8", errors="ignore")
-    hits: list[str] = []
-    patterns = [
-        r"(?i)(jwt|nextauth|secret|token|signing)[^\n]{0,60}([A-Za-z0-9_\-]{32,})",
-        r"(?i)(NEXTAUTH_SECRET|JWT_SECRET|AUTH_SECRET)\s*[=:]\s*([A-Za-z0-9_\-]{32,})",
-        r"(?i)\"(NEXTAUTH_SECRET|JWT_SECRET|AUTH_SECRET)\"\s*:\s*\"([A-Za-z0-9_\-]{32,})\"",
+def root_domain(host: str) -> str:
+    if not host:
+        return ""
+    host = host.split(":")[0].lower()
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+    return ".".join(parts[-2:])
+
+
+def build_idp_bases(target: str, allow_external: bool) -> list[str]:
+    bases: list[str] = []
+    parsed = urlparse(target)
+    scheme = parsed.scheme or "https"
+    host = parsed.netloc or parsed.path
+    root = root_domain(host)
+    subdomains = ["auth", "login", "id", "identity", "sso", "oauth", "oidc"]
+    for sub in subdomains:
+        if root:
+            bases.append(f"{scheme}://{sub}.{root}")
+        bases.append(f"{scheme}://{sub}.{host}")
+
+    if allow_external:
+        bases.extend(
+            [
+                "https://login.microsoftonline.com/common",
+                "https://login.microsoftonline.com/organizations",
+                "https://login.microsoftonline.com/consumers",
+                "https://accounts.google.com",
+            ]
+        )
+    return list(dict.fromkeys(bases))
+
+
+def seed_discovery(
+    base_urls: list[str],
+    output: str,
+    verify: bool,
+    timeout: int,
+    visited: set[str],
+    results: list[Result],
+    lock: threading.Lock,
+    console: "Console",
+    verbose: bool,
+    allow_external: bool,
+    max_candidates: int,
+) -> None:
+    seed_paths = [
+        "/.well-known/openid-configuration",
+        "/.well-known/jwks.json",
+        "/.well-known/oauth-authorization-server",
+        "/v2.0/.well-known/openid-configuration",
+        "/v1.0/.well-known/openid-configuration",
+        "/.well-known/keys",
+        "/oauth2/v1/keys",
+        "/oauth2/default/v1/keys",
+        "/oauth2/v1/keys",
     ]
-    for pattern in patterns:
-        for match in re.findall(pattern, decoded):
-            if isinstance(match, tuple):
-                candidate = match[-1]
-            else:
-                candidate = match
-            if candidate and candidate not in hits:
-                hits.append(candidate)
-    return hits[:10]
+    for base in base_urls:
+        for path in seed_paths:
+            url = base.rstrip("/") + path
+            with lock:
+                if url in visited:
+                    continue
+                visited.add(url)
+            try:
+                response = fetch_url(url, verify=verify, timeout=timeout)
+            except requests.exceptions.SSLError:
+                continue
+            except requests.exceptions.ConnectionError:
+                continue
+            if response is None:
+                continue
+            process_response(
+                url,
+                url,
+                response.status_code,
+                response.content,
+                response.headers.get("content-type", ""),
+                output,
+                verify,
+                timeout,
+                visited,
+                results,
+                lock,
+                console,
+                verbose,
+                allow_external,
+                max_candidates,
+                False,
+            )
 
 
 def jwk_set_to_pems(jwk_set: dict) -> list[bytes]:
@@ -747,7 +825,6 @@ def process_response(
     verbose: bool,
     allow_external: bool,
     max_candidates: int,
-    secret_hunt: bool,
 ) -> None:
     if status != 200:
         if verbose:
@@ -795,7 +872,6 @@ def process_response(
                 verbose,
                 allow_external,
                 max_candidates,
-                secret_hunt,
             )
         if verbose:
             with lock:
@@ -938,11 +1014,6 @@ def process_response(
         with lock:
             results.append(Result(display_path, status, key_type, "-"))
 
-    if secret_hunt:
-        for secret in find_possible_secrets(content):
-            with lock:
-                results.append(Result(display_path, status, "possible-secret", secret))
-
     for candidate in extract_candidate_urls(content, url, allow_external, max_candidates):
         with lock:
             if candidate in visited:
@@ -972,7 +1043,6 @@ def process_response(
             verbose,
             allow_external,
             max_candidates,
-            secret_hunt,
         )
 
 
@@ -988,13 +1058,26 @@ def brute_force(
     discover: bool,
     allow_external: bool,
     max_candidates: int,
-    secret_hunt: bool,
 ) -> list[Result]:
     results: list[Result] = []
     lock = threading.Lock()
     visited: set[str] = set()
 
     if discover:
+        idp_bases = build_idp_bases(target, allow_external)
+        seed_discovery(
+            idp_bases,
+            output,
+            verify,
+            timeout,
+            visited,
+            results,
+            lock,
+            console,
+            verbose,
+            allow_external,
+            max_candidates,
+        )
         try:
             root_response = fetch_url(target + "/", verify=verify, timeout=timeout)
         except requests.exceptions.SSLError:
@@ -1156,7 +1239,6 @@ def run_direct(
             verbose,
             allow_external,
             max_candidates,
-            secret_hunt,
         )
     except Exception:
         if verbose:
@@ -1218,7 +1300,6 @@ def main() -> int:
             console,
             args.follow_hosts,
             args.max_candidates,
-            args.secret_hunt,
         )
         render_summary(results, console)
         return 0
@@ -1246,7 +1327,6 @@ def main() -> int:
             args.discover,
             args.follow_hosts,
             args.max_candidates,
-            args.secret_hunt,
         )
     except requests.exceptions.ConnectionError:
         return 1

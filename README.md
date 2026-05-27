@@ -70,4 +70,4 @@ The PEM file is saved in the directory where you run the command. By default the
 
 ## Discovery Mode
 
-`--discover` scrapes the root HTML and JavaScript bundles to locate embedded JWKS or key URLs before brute-forcing. Use `--follow-hosts` to allow external auth domains.
+`--discover` scrapes the root HTML and JavaScript bundles to locate embedded JWKS or key URLs before brute-forcing. It also probes common IdP endpoints (Auth0, Okta, Cognito, Azure AD, Google-style). Use `--follow-hosts` to allow external auth domains.
