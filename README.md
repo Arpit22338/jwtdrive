@@ -26,6 +26,12 @@ bash install.sh
   Example: `jwtdrive -t https://target.com -k`
 - `-v, --verbose` - Show all attempted paths including failures
   Example: `jwtdrive -t https://target.com -v`
+- `--discover` - Discover keys by scraping root HTML/JS before brute-force
+  Example: `jwtdrive -t https://target.com --discover`
+- `--follow-hosts` - Allow following key URLs on external hosts
+  Example: `jwtdrive -t https://target.com --discover --follow-hosts`
+- `--max-candidates` - Maximum candidate URLs to follow per response (default: 40)
+  Example: `jwtdrive -t https://target.com --discover --max-candidates 80`
 
 ## Usage Examples
 
@@ -35,6 +41,8 @@ jwtdrive -t https://target.com -v --threads 20
 jwtdrive -t https://target.com -o mykey.pem -w custom_wordlist.txt
 jwtdrive -pu https://target.com/.well-known/jwks.json
 jwtdrive -t https://target.com -k -v
+jwtdrive -t https://target.com --discover --follow-hosts
+jwtdrive -t https://target.com --discover --max-candidates 80
 ```
 
 ## Using the PEM with jwt_tool
@@ -59,3 +67,7 @@ The PEM file is saved in the directory where you run the command. By default the
 - Raw PEM public key - Saved directly without conversion
 - X.509 certificate (PEM or DER) - Extracts the public key and saves as PEM
 - OpenID configuration - Follows `jwks_uri` and processes it as a JWK Set
+
+## Discovery Mode
+
+`--discover` scrapes the root HTML and JavaScript bundles to locate embedded JWKS or key URLs before brute-forcing. Use `--follow-hosts` to allow external auth domains.

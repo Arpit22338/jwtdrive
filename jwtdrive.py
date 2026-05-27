@@ -8,6 +8,7 @@ Modules (stdlib):
 - dataclasses: simple structure for result records.
 - json: parse JSON responses safely.
 - os: file path handling and output placement.
+- re: extract likely JWKS/key URLs from responses.
 - threading: Lock to protect shared result collection.
 - urllib.parse: urljoin for relative jwks_uri resolution.
 
@@ -32,6 +33,14 @@ CLI interface (argparse):
   Help: Disable SSL certificate verification (useful for self-signed targets)
 - -v,  --verbose (bool flag, default: False)
   Help: Show all attempted paths including failures
+- --discover (bool flag, default: False)
+  Help: Discover keys by scraping root HTML/JS before brute-force
+- --follow-hosts (bool flag, default: False)
+  Help: Allow following key URLs on external hosts
+- --max-candidates (int, default: 40)
+  Help: Maximum candidate URLs to follow per response
+- --secret-hunt (bool flag, default: False)
+  Help: Scan responses for likely JWT shared secrets (heuristic)
 
 Internal functions:
 - build_arg_parser() -> argparse.ArgumentParser
@@ -46,6 +55,14 @@ Internal functions:
   Purpose: Perform a GET request with error handling.
 - detect_openid_config(data: dict) -> str | None
   Purpose: Extract jwks_uri from openid-configuration responses.
+- extract_candidate_urls(text: bytes, base_url: str, allow_external: bool,
+  max_candidates: int) -> list[str]
+  Purpose: Pull likely JWKS/key URLs from response bodies for follow-up fetches.
+- extract_script_urls(text: bytes, base_url: str, allow_external: bool,
+  max_candidates: int) -> list[str]
+  Purpose: Pull JavaScript asset URLs for scraping JWKS/key references.
+- find_possible_secrets(text: bytes) -> list[str]
+  Purpose: Identify likely shared secret values for HS256 tokens.
 - jwk_set_to_pems(jwk_set: dict) -> list[bytes]
   Purpose: Convert all keys in a JWK Set to PEM-encoded public keys.
 - extract_pem_from_cert(content: bytes) -> bytes | None
@@ -55,7 +72,8 @@ Internal functions:
 - default_output_name(target_url: str) -> str
   Purpose: Build a default PEM filename from the target hostname.
 - process_response(url: str, display_path: str, status: int, content: bytes,
-                   output: str, verify: bool, timeout: int, visited: set[str],
+                   content_type: str, output: str, verify: bool, timeout: int,
+                   visited: set[str],
                    results: list[Result], lock: threading.Lock,
                    console: rich.console.Console, verbose: bool) -> None
   Purpose: Detect key format, convert, save, and record results.
@@ -262,6 +280,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -417,6 +436,7 @@ DEFAULT_HEADERS = {
     "User-Agent": "jwtdrive/1.0",
     "Accept": "application/json,*/*;q=0.8",
 }
+MAX_CANDIDATES = 40
 
 
 @dataclass
@@ -471,6 +491,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show all attempted paths including failures",
     )
+    parser.add_argument(
+        "--discover",
+        action="store_true",
+        help="Discover keys by scraping root HTML/JS before brute-force",
+    )
+    parser.add_argument(
+        "--follow-hosts",
+        action="store_true",
+        help="Allow following key URLs on external hosts",
+    )
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=MAX_CANDIDATES,
+        help="Maximum candidate URLs to follow per response",
+    )
+    parser.add_argument(
+        "--secret-hunt",
+        action="store_true",
+        help="Scan responses for likely JWT shared secrets (heuristic)",
+    )
     return parser
 
 
@@ -523,7 +564,12 @@ def load_wordlist(path: str | None) -> list[str]:
 def normalize_base_url(target: str) -> str:
     if "//" not in target:
         target = f"https://{target}"
-    return target.rstrip("/")
+    parsed = urlparse(target)
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc or parsed.path
+    if not netloc:
+        return target.rstrip("/")
+    return f"{scheme}://{netloc}".rstrip("/")
 
 
 def preflight_connectivity(url: str, verify: bool, timeout: int, console: "Console") -> bool:
@@ -567,6 +613,77 @@ def detect_openid_config(data: dict) -> str | None:
     if isinstance(jwks_uri, str) and jwks_uri.strip():
         return jwks_uri.strip()
     return None
+
+
+def extract_candidate_urls(
+    text: bytes,
+    base_url: str,
+    allow_external: bool,
+    max_candidates: int,
+) -> list[str]:
+    candidates: list[str] = []
+    decoded = text.decode("utf-8", errors="ignore")
+    base_host = urlparse(base_url).netloc
+    patterns = [
+        r"https?://[\w\-\.:]+/[\w\-\./]+",
+        r"/[\w\-\./]+",
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, decoded):
+            if len(candidates) >= max_candidates:
+                return candidates
+            url = match
+            if url.startswith("/"):
+                url = urljoin(base_url, url)
+            if not allow_external and urlparse(url).netloc and urlparse(url).netloc != base_host:
+                continue
+            if url not in candidates:
+                candidates.append(url)
+    filtered = [c for c in candidates if any(k in c.lower() for k in ("jwks", "jwk", "keys", "cert", "openid"))]
+    return filtered[:max_candidates]
+
+
+def extract_script_urls(
+    text: bytes,
+    base_url: str,
+    allow_external: bool,
+    max_candidates: int,
+) -> list[str]:
+    decoded = text.decode("utf-8", errors="ignore")
+    script_urls: list[str] = []
+    base_host = urlparse(base_url).netloc
+    for match in re.findall(r"<script[^>]+src=[\"']([^\"']+)[\"']", decoded, re.IGNORECASE):
+        url = match
+        if url.startswith("/"):
+            url = urljoin(base_url, url)
+        if url.startswith("//"):
+            url = "https:" + url
+        if not allow_external and urlparse(url).netloc and urlparse(url).netloc != base_host:
+            continue
+        if url not in script_urls:
+            script_urls.append(url)
+        if len(script_urls) >= max_candidates:
+            break
+    return script_urls
+
+
+def find_possible_secrets(text: bytes) -> list[str]:
+    decoded = text.decode("utf-8", errors="ignore")
+    hits: list[str] = []
+    patterns = [
+        r"(?i)(jwt|nextauth|secret|token|signing)[^\n]{0,60}([A-Za-z0-9_\-]{32,})",
+        r"(?i)(NEXTAUTH_SECRET|JWT_SECRET|AUTH_SECRET)\s*[=:]\s*([A-Za-z0-9_\-]{32,})",
+        r"(?i)\"(NEXTAUTH_SECRET|JWT_SECRET|AUTH_SECRET)\"\s*:\s*\"([A-Za-z0-9_\-]{32,})\"",
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, decoded):
+            if isinstance(match, tuple):
+                candidate = match[-1]
+            else:
+                candidate = match
+            if candidate and candidate not in hits:
+                hits.append(candidate)
+    return hits[:10]
 
 
 def jwk_set_to_pems(jwk_set: dict) -> list[bytes]:
@@ -619,6 +736,7 @@ def process_response(
     display_path: str,
     status: int,
     content: bytes,
+    content_type: str,
     output: str,
     verify: bool,
     timeout: int,
@@ -627,6 +745,9 @@ def process_response(
     lock: threading.Lock,
     console: "Console",
     verbose: bool,
+    allow_external: bool,
+    max_candidates: int,
+    secret_hunt: bool,
 ) -> None:
     if status != 200:
         if verbose:
@@ -641,6 +762,45 @@ def process_response(
 
     text_sample = content[:2048]
     key_type = "unknown"
+
+    content_type = (content_type or "").lower()
+    html_marker = b"<html" in text_sample.lower() or text_sample.startswith(b"<!doctype html")
+    if "text/html" in content_type or html_marker:
+        for script_url in extract_script_urls(content, url, allow_external, max_candidates):
+            with lock:
+                if script_url in visited:
+                    continue
+                visited.add(script_url)
+            try:
+                response = fetch_url(script_url, verify=verify, timeout=timeout)
+            except requests.exceptions.SSLError:
+                continue
+            except requests.exceptions.ConnectionError:
+                raise
+            if response is None:
+                continue
+            process_response(
+                script_url,
+                script_url,
+                response.status_code,
+                response.content,
+                response.headers.get("content-type", ""),
+                output,
+                verify,
+                timeout,
+                visited,
+                results,
+                lock,
+                console,
+                verbose,
+                allow_external,
+                max_candidates,
+                secret_hunt,
+            )
+        if verbose:
+            with lock:
+                results.append(Result(display_path, status, "html", "-"))
+        return
 
     data = None
     for encoding in ("utf-8", "utf-8-sig", "latin-1"):
@@ -682,6 +842,7 @@ def process_response(
                     resolved,
                     response.status_code,
                     response.content,
+                    response.headers.get("content-type", ""),
                     output,
                     verify,
                     timeout,
@@ -777,6 +938,43 @@ def process_response(
         with lock:
             results.append(Result(display_path, status, key_type, "-"))
 
+    if secret_hunt:
+        for secret in find_possible_secrets(content):
+            with lock:
+                results.append(Result(display_path, status, "possible-secret", secret))
+
+    for candidate in extract_candidate_urls(content, url, allow_external, max_candidates):
+        with lock:
+            if candidate in visited:
+                continue
+            visited.add(candidate)
+        try:
+            response = fetch_url(candidate, verify=verify, timeout=timeout)
+        except requests.exceptions.SSLError:
+            return
+        except requests.exceptions.ConnectionError:
+            raise
+        if response is None:
+            continue
+        process_response(
+            candidate,
+            candidate,
+            response.status_code,
+            response.content,
+            response.headers.get("content-type", ""),
+            output,
+            verify,
+            timeout,
+            visited,
+            results,
+            lock,
+            console,
+            verbose,
+            allow_external,
+            max_candidates,
+            secret_hunt,
+        )
+
 
 def brute_force(
     target: str,
@@ -787,10 +985,49 @@ def brute_force(
     timeout: int,
     verbose: bool,
     console: "Console",
+    discover: bool,
+    allow_external: bool,
+    max_candidates: int,
+    secret_hunt: bool,
 ) -> list[Result]:
     results: list[Result] = []
     lock = threading.Lock()
     visited: set[str] = set()
+
+    if discover:
+        try:
+            root_response = fetch_url(target + "/", verify=verify, timeout=timeout)
+        except requests.exceptions.SSLError:
+            console.print(
+                f"[yellow]SSL error for {target}/. Try -k to disable verification.[/yellow]"
+            )
+            root_response = None
+        except requests.exceptions.ConnectionError:
+            console.print("[red]Connection failed. Host unreachable or DNS failed.[/red]")
+            raise
+        if root_response is not None:
+            try:
+                process_response(
+                    target + "/",
+                    "/",
+                    root_response.status_code,
+                    root_response.content,
+                    root_response.headers.get("content-type", ""),
+                    output,
+                    verify,
+                    timeout,
+                    visited,
+                    results,
+                    lock,
+                    console,
+                    verbose,
+                    allow_external,
+                    max_candidates,
+                    secret_hunt,
+                )
+            except Exception:
+                if verbose:
+                    results.append(Result("/", root_response.status_code, "error", "-"))
 
     def worker(path: str) -> None:
         url = f"{target}{path}"
@@ -823,6 +1060,7 @@ def brute_force(
                 path,
                 response.status_code,
                 response.content,
+                response.headers.get("content-type", ""),
                 output,
                 verify,
                 timeout,
@@ -831,6 +1069,9 @@ def brute_force(
                 lock,
                 console,
                 verbose,
+                allow_external,
+                max_candidates,
+                secret_hunt,
             )
         except Exception:
             if verbose:
@@ -868,6 +1109,9 @@ def run_direct(
     timeout: int,
     verbose: bool,
     console: "Console",
+    allow_external: bool,
+    max_candidates: int,
+    secret_hunt: bool,
 ) -> list[Result]:
     results: list[Result] = []
     lock = threading.Lock()
@@ -901,6 +1145,7 @@ def run_direct(
             url,
             response.status_code,
             response.content,
+            response.headers.get("content-type", ""),
             output,
             verify,
             timeout,
@@ -909,6 +1154,9 @@ def run_direct(
             lock,
             console,
             verbose,
+            allow_external,
+            max_candidates,
+            secret_hunt,
         )
     except Exception:
         if verbose:
@@ -968,6 +1216,9 @@ def main() -> int:
             DEFAULT_TIMEOUT,
             args.verbose,
             console,
+            args.follow_hosts,
+            args.max_candidates,
+            args.secret_hunt,
         )
         render_summary(results, console)
         return 0
@@ -992,6 +1243,10 @@ def main() -> int:
             DEFAULT_TIMEOUT,
             args.verbose,
             console,
+            args.discover,
+            args.follow_hosts,
+            args.max_candidates,
+            args.secret_hunt,
         )
     except requests.exceptions.ConnectionError:
         return 1
